@@ -19,6 +19,7 @@ const {
 } = require('../../scripts/auto-update');
 const {
   createInstallState,
+  writeInstallState,
 } = require('../../scripts/lib/install-state');
 
 function test(name, fn) {
@@ -655,6 +656,91 @@ function runTests() {
       cleanup(homeDir);
       cleanup(projectRoot);
       cleanup(repoRoot);
+    }
+  })) passed += 1; else failed += 1;
+
+  if (test('global --dry-run skips git pull and previews auto-update without mutating the repo', () => {
+    const fixture = createTempDir('auto-update-global-dry-run-');
+    const homeDir = path.join(fixture, 'home');
+    const projectRoot = path.join(fixture, 'project');
+    const remoteRepo = path.join(fixture, 'remote.git');
+    const localRepo = path.join(fixture, 'local-ecc');
+    const realRepoRoot = path.resolve(__dirname, '..', '..');
+    fs.mkdirSync(homeDir);
+    fs.mkdirSync(projectRoot);
+
+    try {
+      execFileSync('git', ['init', '--bare', '-b', 'main', remoteRepo], { encoding: 'utf8' });
+      execFileSync('git', ['clone', remoteRepo, localRepo], { encoding: 'utf8' });
+      execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: localRepo, encoding: 'utf8' });
+      execFileSync('git', ['config', 'user.name', 'Test'], { cwd: localRepo, encoding: 'utf8' });
+      ensureFakeRepo(localRepo);
+      fs.writeFileSync(
+        path.join(localRepo, 'scripts', 'install-apply.js'),
+        [
+          '#!/usr/bin/env node',
+          'const dryRun = process.argv.includes("--dry-run");',
+          'process.stdout.write(JSON.stringify({ dryRun, argv: process.argv.slice(2), plan: {} }));',
+        ].join('\n') + '\n'
+      );
+      execFileSync('git', ['add', '.'], { cwd: localRepo, encoding: 'utf8' });
+      execFileSync('git', ['commit', '-m', 'initial'], { cwd: localRepo, encoding: 'utf8' });
+      execFileSync('git', ['push', '-u', 'origin', 'main'], { cwd: localRepo, encoding: 'utf8' });
+      const headBefore = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: localRepo, encoding: 'utf8' }).trim();
+
+      const pusherRepo = path.join(fixture, 'pusher');
+      execFileSync('git', ['clone', remoteRepo, pusherRepo], { encoding: 'utf8' });
+      execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: pusherRepo, encoding: 'utf8' });
+      execFileSync('git', ['config', 'user.name', 'Test'], { cwd: pusherRepo, encoding: 'utf8' });
+      fs.writeFileSync(path.join(pusherRepo, 'UPSTREAM.txt'), 'new commit\n');
+      execFileSync('git', ['add', 'UPSTREAM.txt'], { cwd: pusherRepo, encoding: 'utf8' });
+      execFileSync('git', ['commit', '-m', 'upstream update'], { cwd: pusherRepo, encoding: 'utf8' });
+      execFileSync('git', ['push', 'origin', 'main'], { cwd: pusherRepo, encoding: 'utf8' });
+
+      const targetRoot = path.join(projectRoot, '.cursor');
+      const statePath = path.join(targetRoot, 'ecc-install-state.json');
+      fs.mkdirSync(targetRoot, { recursive: true });
+      writeInstallState(statePath, createInstallState({
+        adapter: { id: 'cursor-project', target: 'cursor', kind: 'project' },
+        targetRoot,
+        installStatePath: statePath,
+        request: {
+          profile: null,
+          modules: [],
+          includeComponents: [],
+          excludeComponents: [],
+          legacyLanguages: ['typescript'],
+          legacyMode: true,
+          hookConsent: 'declined',
+        },
+        resolution: { selectedModules: ['legacy-cursor-install'], skippedModules: [] },
+        source: { repoVersion: '1.10.0', repoCommit: headBefore, manifestVersion: 1 },
+        operations: [],
+      }));
+
+      const baseEnv = { ...process.env, HOME: homeDir, USERPROFILE: homeDir };
+      delete baseEnv.ECC_DRY_RUN;
+      const previewRaw = execFileSync(process.execPath, [
+        path.join(realRepoRoot, 'scripts', 'ecc.js'),
+        '--dry-run', 'auto-update', '--target', 'cursor', '--repo-root', localRepo, '--json',
+      ], { cwd: projectRoot, env: baseEnv, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+      const preview = JSON.parse(previewRaw);
+
+      assert.strictEqual(preview.dryRun, true);
+      assert.strictEqual(preview.results[0].status, 'planned');
+      assert.strictEqual(preview.results[0].payload.dryRun, true);
+      const headAfter = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: localRepo, encoding: 'utf8' }).trim();
+      assert.strictEqual(headAfter, headBefore);
+      assert.strictEqual(fs.existsSync(path.join(localRepo, 'UPSTREAM.txt')), false);
+
+      assert.throws(
+        () => execFileSync(process.execPath, [
+          path.join(realRepoRoot, 'scripts', 'auto-update.js'), '--json',
+        ], { cwd: projectRoot, env: { ...baseEnv, ECC_DRY_RUN: 'yes' }, encoding: 'utf8', stdio: 'pipe' }),
+        error => /ECC_DRY_RUN must be "1" or "0"/.test(error.stderr)
+      );
+    } finally {
+      cleanup(fixture);
     }
   })) passed += 1; else failed += 1;
 
